@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yttui"
+version = "0.1.0"
+description = "Interactive terminal front-end for yt-dlp, with in-terminal thumbnail rendering"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+keywords = ["yt-dlp", "tui", "downloader", "youtube", "terminal"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = [
+  "textual>=0.60",
+  "rich>=13",
+  "pillow>=10",
+]
+
+# yt-dlp and ffmpeg are NOT Python packages here: yttui shells out to the
+# `yt-dlp` binary and expects `ffmpeg` on PATH, so that one shared
+# ~/.config/yt-dlp/config governs both yttui and the user's shell.
+[project.urls]
+Homepage = "https://github.com/krshforever/yttui"
+Source = "https://github.com/krshforever/yttui"
+
+[project.scripts]
+yttui = "yttui:main"
+
+[tool.setuptools]
+py-modules = ["yttui"]
