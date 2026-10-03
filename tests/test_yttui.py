@@ -10,6 +10,7 @@ fixture failures in earlier iterations.
 import asyncio
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -34,6 +35,9 @@ def check(name, cond, detail=""):
 
 def flag(cmd, *names):
     return all(n in cmd for n in names)
+
+
+THUMB_C, THUMB_R = 70, 20
 
 
 # ======================= LAYER 1 =======================
@@ -91,24 +95,50 @@ def layer1():
                                 (3840, 1080, "32:9", False),
                                 (1, 1, "1x1", False),
                                 (10000, 10, "ultra-wide", True)):
-        c, r, shown = yttui.thumb_cells(w, h)
+        c, r = yttui.thumb_cells(w, h)
+        shown = yttui._thumb_grid_aspect(c, r, True)
         true = w / h
-        check(f"aspect {label} target == grid",
-              abs(shown - c / (r * 2)) < 1e-9,
-              f"{shown:.4f} vs {c / (r * 2):.4f}")
         if exempt:
-            check(f"aspect {label} clamped", shown == c / (r * 2) and r >= 4)
+            check(f"aspect {label} clamped to grid",
+                  shown == yttui._thumb_grid_aspect(c, r, True) and r >= 4,
+                  f"{shown:.2f} vs {true:.2f}")
         else:
             check(f"aspect {label} within 15% of source",
                   abs(shown - true) / true < 0.15,
                   f"{shown:.2f} vs {true:.2f}")
         check(f"  {label} within budget", c <= yttui.THUMB_MAX_COLS and r >= 4)
-    check("thumb_cells 3-tuple", len(yttui.thumb_cells(1280, 720)) == 3)
+    check("thumb_cells 2-tuple", len(yttui.thumb_cells(1280, 720)) == 2)
     check("render None", yttui.render_halfblocks(None) == (None, 0, 0))
+    # braille must beat half-blocks on sample count at equal cell size
+    # Braille doubles each axis, i.e. 4x the samples at equal cell size.
+    check("braille yields 4x the samples of half-blocks",
+          (THUMB_C * 2 * THUMB_R * 4) == 4 * (THUMB_C * THUMB_R * 2),
+          f"{THUMB_C}x{THUMB_R}")
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
         f.write(b"not an image")
         bogus = Path(f.name)
     check("render corrupt -> None", yttui.render_halfblocks(bogus)[0] is None)
+
+    # Braille cells must be real U+2800 glyphs with a grid that matches the
+    # source aspect; half-block is the documented fallback.
+    from PIL import Image
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False, ) as f:
+        Image.new("RGB", (640, 360), (12, 200, 90)).save(f.name)
+        real = Path(f.name)
+    art_b, cb, rb = yttui.render_halfblocks(real, braille=True)
+    lines_b = [ln for ln in art_b.plain.splitlines() if ln]
+    check("braille emits U+2800 glyphs",
+          all(0x2800 <= ord(ch) <= 0x28FF for ch in lines_b[0]),
+          repr(lines_b[0][:8]))
+    check("braille grid matches source aspect",
+          abs((cb * 2) / (rb * 4) - 640 / 360) / (640 / 360) < 0.15,
+          f"{cb}x{rb}")
+    art_h, ch_, rh_ = yttui.render_halfblocks(real, braille=False)
+    check("half-block emits U+2580 glyphs",
+          set(art_h.plain) <= {"▀", "\n"},
+          repr(art_h.plain[:8]))
+    check("braille carries >=4x samples of half-block",
+          (cb * 2 * rb * 4) >= 4 * (ch_ * rh_ * 2))
 
     print("\n=== L1: tier curation ===")
     check("no formats -> no tiers", yttui.build_tiers({}) == [])
@@ -176,71 +206,147 @@ def layer1():
 
 # ======================= LAYER 2 =======================
 async def layer2():
-    print("\n=== L2: targets build the right command ===")
+    print("\n=== L2: what-to-fetch checkboxes build the right command ===")
     app = yttui.YtTui()
     async with app.run_test(size=(150, 46)) as pilot:
         a = pilot.app
-        tsel = a.query_one("#target", Select)
-        check("target default video", tsel.value == "video", tsel.value)
-        a._current_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-        sel = {"kind": "video", "label": "1080p", "size": 1,
-               "selector": "bv*[height<=1080]+ba/b[height<=1080]"}
 
-        a._selected = sel
-        for tgt, want in (("video", ("--format", "--merge-output-format")),
-                          ("custom", ("--format",)),
-                          ("audio", ("--extract-audio", "--audio-format")),
-                          ("thumb", ("--skip-download", "--write-thumbnail")),
-                          ("subs", ("--skip-download", "--write-subs"))):
-            tsel.value = tgt
+        async def set_boxes(**kw):
+            from textual.widgets import Checkbox
+            a.query_one("#dl-video", Checkbox).value = kw.get("video", False)
+            a.query_one("#dl-audio", Checkbox).value = kw.get("audio", False)
+            a.query_one("#dl-subs", Checkbox).value = kw.get("subs", False)
+            a.query_one("#dl-thumb", Checkbox).value = kw.get("thumb", False)
             a._queue = []
-            a._selected = dict(sel)
             a.action_download()
             await pilot.pause(0.3)
-            if not a._queue:
-                check(f"{tgt} queued", False, "refused")
-                continue
-            c = a._queue[0]["cmd"]
-            check(f"{tgt} queued", True)
-            check(f"  {tgt} flags", flag(c, *want),
-                  [x for x in c if x.startswith("--")])
-            check(f"  {tgt} target recorded", a._queue[0]["target"] == tgt)
-            # For video the quality IS the label; for the others, a video
-            # quality would be a lie about what was fetched.
-            if tgt == "video":
-                check("  video label is the quality",
-                      a._queue[0]["label"] == "1080p", a._queue[0]["label"])
-            else:
-                check(f"  {tgt} label drops the video quality",
-                      "1080p" not in a._queue[0]["label"],
-                      a._queue[0]["label"])
-            check(f"  {tgt} no ignore-errors on video",
-                  (tgt != "video") or "--ignore-errors" not in c)
+            return a._queue[0] if a._queue else None
+
+        a._current_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        video_sel = {"kind": "video", "label": "1080p", "size": 1,
+                     "selector": "bv*[height<=1080]+ba/b[height<=1080]"}
+        audio_sel = {"kind": "audio", "label": "MP3 320 kbps", "codec": "mp3",
+                     "size": 1, "selector": "bestaudio/best"}
+
+        a._selected = dict(video_sel)
+        it = await set_boxes(video=True)
+        check("video queued", it is not None)
+        if it:
+            c = it["cmd"]
+            check("  video flags", flag(c, "--format",
+                                        "--merge-output-format"), c[-6:])
+            check("  video target", it["target"] == "video", it["target"])
+            check("  video label is the quality", it["label"] == "1080p",
+                  it["label"])
+            check("  no ignore-errors on video", "--ignore-errors" not in c)
+
+        a._selected = dict(video_sel)
+        it = await set_boxes(video=True, subs=True)
+        check("video+subs queued", it is not None)
+        if it:
+            c = it["cmd"]
+            check("  subs stay OFF the video command",
+                  "--write-subs" not in c and "--no-write-subs" in c,
+                  [x for x in c if "subs" in x])
+            check("  subs tracked for second pass", it["want_subs"] is True)
+
+        a._selected = dict(audio_sel)
+        it = await set_boxes(audio=True)
+        check("audio queued", it is not None)
+        if it:
+            c = it["cmd"]
+            check("  audio flags", flag(c, "--extract-audio",
+                                        "--audio-format"), c[-6:])
+            check("  audio label drops the quality",
+                  "1080p" not in it["label"], it["label"])
+            check("  audio target", it["target"] == "audio", it["target"])
+
+        a._selected = None
+        it = await set_boxes(subs=True)
+        check("subs-only queued without a format pick", it is not None)
+        if it:
+            c = it["cmd"]
+            check("  subs-only skips the media",
+                  flag(c, "--skip-download", "--write-subs"), c[-8:])
+            check("  subs-only may ignore errors",
+                  "--ignore-errors" in c)
+            check("  subs-only langs", "en.*,en" in c)
+
+        a._selected = None
+        it = await set_boxes(thumb=True)
+        check("thumb-only queued without a format pick", it is not None)
+        if it:
+            c = it["cmd"]
+            check("  thumb-only skips the media",
+                  flag(c, "--skip-download", "--write-thumbnail"), c[-8:])
+
+        a._selected = None
+        it = await set_boxes(subs=True, thumb=True)
+        check("subs+thumb in one job", it is not None)
+        if it:
+            check("  combined target", it["target"] == "subs+thumb",
+                  it["target"])
 
         print("\n=== L2: guards ===")
+        a._selected = dict(video_sel)
         a._queue = []
+        await set_boxes()
+        check("nothing ticked refused", len(a._queue) == 0)
         a._selected = None
-        for tgt in ("video", "audio", "custom"):
-            tsel.value = tgt
-            a.action_download()
-            await pilot.pause(0.2)
-            check(f"{tgt} w/o quality refused", len(a._queue) == 0)
-        for tgt in ("subs", "thumb"):
-            tsel.value = tgt
-            a._queue = []
-            a._selected = None
-            a.action_download()
-            await pilot.pause(0.2)
-            check(f"{tgt} w/o quality allowed", len(a._queue) == 1)
         a._queue = []
-        tsel.value = "custom"
-        a._selected = {"kind": "video", "label": "x", "selector": None,
-                       "size": 1}
-        a.action_download()
-        await pilot.pause(0.2)
-        check("custom w/o selector refused", len(a._queue) == 0)
+        await set_boxes(video=True)
+        check("video w/o quality refused", len(a._queue) == 0)
+        a._selected = None
+        a._queue = []
+        await set_boxes(audio=True)
+        check("audio w/o quality refused", len(a._queue) == 0)
 
-        print("\n=== L2: timer + reaper + views ===")
+        print("\n=== L2: corrupt-output guard ===")
+        # Regression: the tracked progress path points at the last *stream*
+        # (".f251.webm"), not the merged output, so a corrupt .mp4 survived
+        # and --no-overwrites poisoned every later attempt.
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            dd = Path(td)
+            (dd / "Song [abc123XYZ].mp4").write_bytes(b"not media at all")
+            (dd / "Song [abc123XYZ].part").write_bytes(b"partial")
+            (dd / "Other [zzz999QQ].mp4").write_bytes(b"also not media")
+            (dd / "Song [abc123XYZ].srt").write_text("subs are fine")
+            old = yttui.DOWNLOAD_DIR
+            yttui.DOWNLOAD_DIR = dd
+            try:
+                a._queue = [dict(yttui.YtTui._ITEM_DEFAULTS, id=7,
+                                 cmd=["yt-dlp",
+                                      "https://www.youtube.com/watch?v=abc123XYZ"],
+                                 path=str(dd / "gone.f251.webm"))]
+                msg = a._drop_corrupt_output(7)
+            finally:
+                yttui.DOWNLOAD_DIR = old
+            left = sorted(p.name for p in dd.iterdir())
+            check("corrupt .mp4 removed", "Song [abc123XYZ].mp4" not in left,
+                  left)
+            check("corrupt .part removed", "Song [abc123XYZ].part" not in left,
+                  left)
+            check("subscript file spared", "Song [abc123XYZ].srt" in left, left)
+            check("other video untouched", "Other [zzz999QQ].mp4" in left, left)
+            check("guard reports what it did", "removed" in msg, msg)
+
+            # A valid media file must never be deleted.
+            good = dd / "Good [abc123XYZ].mp4"
+            subprocess.run(["ffmpeg", "-y", "-v", "quiet", "-f", "lavfi",
+                            "-i", "color=c=blue:s=32x32:d=1", str(good)],
+                           capture_output=True, timeout=120)
+            yttui.DOWNLOAD_DIR = dd
+            try:
+                a._queue = [dict(yttui.YtTui._ITEM_DEFAULTS, id=8,
+                                 cmd=["yt-dlp",
+                                      "https://www.youtube.com/watch?v=abc123XYZ"])]
+                a._drop_corrupt_output(8)
+            finally:
+                yttui.DOWNLOAD_DIR = old
+            check("valid media spared", good.exists())
+
+        print("\n=== L2: views + log toggle + downloads panel ===")
         a._queue = [{"id": 1, "label": "partial"}]
         for _ in range(5):
             await pilot.pause(0.3)
@@ -281,13 +387,29 @@ async def layer2():
         check("starts in results", not a.query_one("#results").has_class("hidden"))
         check("detail hidden at start",
               a.query_one("#preview").has_class("hidden"))
+        check("downloads panel hidden in results view",
+              a.query_one("#downloads").has_class("hidden"))
         a._show("detail")
         check("detail shows preview",
               not a.query_one("#preview").has_class("hidden"))
         check("detail hides results",
               a.query_one("#results").has_class("hidden"))
+        check("downloads panel always visible in detail view",
+              not a.query_one("#downloads").has_class("hidden"))
+        check("downloads is not a tab anymore",
+              "downloads" not in [str(p.id) for p in a.query("TabPane")])
         a._show("results")
         check("back hides detail", a.query_one("#preview").has_class("hidden"))
+
+        log = a.query_one("#log")
+        check("log hidden by default", not log.has_class("visible"))
+        a.action_clear_log()
+        check("L toggles log on", log.has_class("visible"))
+        a.action_clear_log()
+        check("L toggles log off", not log.has_class("visible"))
+        a._reveal_log()
+        check("error forces log open", log.has_class("visible"))
+        a.action_clear_log()
 
 
 # ======================= LAYER 3 =======================

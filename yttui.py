@@ -35,10 +35,8 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
-    Label,
     Log,
     ProgressBar,
-    Select,
     Static,
     TabbedContent,
     TabPane,
@@ -53,18 +51,11 @@ SEARCH_COUNT = 10
 # Thumbnail budget in terminal CELLS. Terminal cells are roughly twice as
 # tall as they are wide, and a half-block carries two pixels vertically, so a
 # cols x rows cell block yields a cols x (rows*2) pixel image.
-THUMB_MAX_COLS = 58
+THUMB_MAX_COLS = 70
 THUMB_MAX_ROWS = 20
 
-# What to fetch. yt-dlp can return any of these independently -- a subtitle
-# or a thumbnail does not require downloading the video at all.
-TARGETS = [
-    ("Video + audio", "video"),
-    ("Audio only", "audio"),
-    ("Subtitles only", "subs"),
-    ("Thumbnail only", "thumb"),
-    ("Custom format id", "custom"),
-]
+MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".part",
+                  ".ytdl", ".mp3", ".m4a", ".opus", ".flac", ".wav")
 
 AUDIO_TIERS = [
     ("MP3 320 kbps", "mp3", "320"),
@@ -340,38 +331,61 @@ def fetch_thumb(url: str, dest_name: str = "yttui-thumb.jpg") -> Path | None:
 
 def thumb_cells(img_w: int, img_h: int,
                 max_cols: int = THUMB_MAX_COLS,
-                max_rows: int = THUMB_MAX_ROWS) -> tuple[int, int]:
+                max_rows: int = THUMB_MAX_ROWS,
+                braille: bool = True) -> tuple[int, int]:
     """Cell counts for an image, clamped to what the cell budget can show.
 
-    A terminal cell is about twice as tall as wide and a half-block holds two
-    pixels stacked, so a cols x rows block is a cols x rows*2 grid of SQUARE
-    pixels. To show a w:h image undistorted:
+    Braille mode (U+2800) gives each cell a 2x4 dot grid, so the sample grid is
+    (2*cols) x (4*rows) -- twice the linear resolution of half-blocks, which
+    only manage 1x2. Both use SQUARE samples, so to show a w:h image
+    undistorted:
 
-        cols / (rows * 2) == w / h   =>   cols = rows * 2 * (w / h)
+        braille:     2*cols / (4*rows) == w / h  =>  cols == 2 * rows * (w/h)
+        half-block:      cols / (2*rows) == w / h  =>  cols == 2 * rows * (w/h)
 
-    Beyond roughly 5:1 that equation can no longer be satisfied -- the width
-    cap forces fewer than 4 rows -- so the aspect is clamped to the most
-    extreme one actually renderable and render_halfblocks centre-crops to it.
-    Stretching instead would misrepresent the image.
+    Both land on the same formula; only the resulting detail differs.
+
+    Beyond roughly 5:1 the width cap forces fewer than 4 rows, so the aspect is
+    clamped to the most extreme value actually renderable and the renderer
+    centre-crops to it. Stretching would misrepresent the image.
     """
     aspect = (img_w / img_h) if img_w and img_h else 16 / 9
     cols = max(8, round(max_rows * 2 * aspect))
     if cols > max_cols:
         cols = max_cols
     rows = max(4, round(cols / (2 * aspect)))
-    # The crop target MUST equal the grid aspect exactly. Returning the
-    # source aspect instead leaves a mismatch, and since render_halfblocks
-    # resizes to (cols, rows*2) regardless of aspect, that mismatch silently
-    # stretches the image -- the very bug this function exists to prevent.
-    return cols, rows, cols / (rows * 2)
+    return cols, rows
+
+
+def _thumb_grid_aspect(cols: int, rows: int, braille: bool) -> float:
+    """Aspect of the sample grid these cells actually produce."""
+    return (2 * cols) / (4 * rows) if braille else cols / (2 * rows)
+
+
+# Braille bit layout (U+2800 + n). Bit order is column-major within rows:
+#   0 1   row 0
+#   2 3   row 1
+#   4 5   row 2
+#   6 7   row 3
+_BRAILLE_BITS = ((0, 0, 0x01), (0, 1, 0x02), (1, 0, 0x04), (1, 1, 0x08),
+                 (0, 2, 0x10), (0, 3, 0x20), (1, 2, 0x40), (1, 3, 0x80))
 
 
 def render_halfblocks(path: Path | None,
                       max_cols: int = THUMB_MAX_COLS,
-                      max_rows: int = THUMB_MAX_ROWS) -> tuple[Text | None, int, int]:
-    """Turn an image into '▀' cells: top pixel as fg, bottom as bg.
+                      max_rows: int = THUMB_MAX_ROWS,
+                      braille: bool = True) -> tuple[Text | None, int, int]:
+    """Turn an image into text cells.
 
-    Works in any 24-bit-colour terminal, so it needs no graphics protocol.
+    braille=True  -> U+2800 cells, each a 2x4 dot grid. The top 2x2 dots are
+                     painted in the foreground colour and the bottom 2x2 in the
+                     background, so one cell carries 4 colour samples instead
+                     of half-block's 2. Roughly double the detail per axis,
+                     which is the difference between "recognisable" and
+                     "flat horizontal streaks".
+    braille=False -> '▀' half-blocks: top pixel foreground, bottom background.
+                     Kept as a fallback for fonts with no braille glyphs.
+
     Returns (text, cols, rows) so the caller can size the widget to match.
     """
     if not path:
@@ -385,27 +399,68 @@ def render_halfblocks(path: Path | None,
     except Exception:
         return None, 0, 0
 
-    cols, rows, target = thumb_cells(*img.size, max_cols, max_rows)
+    cols, rows = thumb_cells(*img.size, max_cols, max_rows)
+    target = _thumb_grid_aspect(cols, rows, braille)
 
     # Centre-crop to the aspect we can actually render, THEN resize. Cropping
     # after resizing is what stretched thumbnails in earlier versions.
     src_w, src_h = img.size
-    if src_w / src_h > target:                 # too wide: trim the sides
+    if src_w / src_h > target:
         new_w = max(1, int(round(src_h * target)))
         left = (src_w - new_w) // 2
         img = img.crop((left, 0, left + new_w, src_h))
-    elif src_w / src_h < target:               # too tall: trim top/bottom
+    elif src_w / src_h < target:
         new_h = max(1, int(round(src_w / target)))
         top = (src_h - new_h) // 2
         img = img.crop((0, top, src_w, top + new_h))
-    img = img.resize((cols, rows * 2), Image.LANCZOS)
 
-    px = img.load()
     txt = Text()
-    for y in range(rows):
-        for x in range(cols):
-            tr, tg, tb = px[x, y * 2]
-            br, bg_, bb = px[x, y * 2 + 1]
+    if braille:
+        img = img.resize((cols * 2, rows * 4), Image.LANCZOS)
+        px = img.load()
+
+        def avg(xs, ys):
+            r = g = b = n = 0
+            for yy in ys:
+                for xx in xs:
+                    c = px[xx, yy]
+                    r += c[0]
+                    g += c[1]
+                    b += c[2]
+                    n += 1
+            return r // n, g // n, b // n
+
+        for cy in range(rows):
+            for cx in range(cols):
+                # Top 2x2 (dots 0-3) -> fg, bottom 2x2 (dots 4-7) -> bg.
+                fx = (cx * 2, cx * 2 + 1)
+                fy = (cy * 4, cy * 4 + 1)
+                bx = (cx * 2, cx * 2 + 1)
+                by = (cy * 4 + 2, cy * 4 + 3)
+                fr, fg_, fb = avg(fx, fy)
+                br, bg_, bb = avg(bx, by)
+                # Assign each sub-dot to whichever of the two it resembles,
+                # which dithers gradients instead of banding them.
+                pattern = 0
+                for ox, oy, bit in _BRAILLE_BITS:
+                    c = px[cx * 2 + ox, cy * 4 + oy]
+                    if (c[0] - fr) ** 2 + (c[1] - fg_) ** 2 + \
+                            (c[2] - fb) ** 2 <= \
+                            (c[0] - br) ** 2 + (c[1] - bg_) ** 2 + \
+                            (c[2] - bb) ** 2:
+                        pattern |= bit
+                txt.append(chr(0x2800 + pattern),
+                           style=f"#{fr:02x}{fg_:02x}{fb:02x} on "
+                                 f"#{br:02x}{bg_:02x}{bb:02x}")
+            txt.append("\n")
+        return txt, cols, rows
+
+    img = img.resize((cols, rows * 2), Image.LANCZOS)
+    px = img.load()
+    for cy in range(rows):
+        for cx in range(cols):
+            tr, tg, tb = px[cx, cy * 2]
+            br, bg_, bb = px[cx, cy * 2 + 1]
             txt.append("▀",
                        style=f"#{tr:02x}{tg:02x}{tb:02x} on "
                              f"#{br:02x}{bg_:02x}{bb:02x}")
@@ -418,10 +473,7 @@ class YtTui(App):
     SUB_TITLE = "@krshforever"
 
     CSS = """
-    Screen {
-        background: $surface;
-        layers: base above;
-    }
+    Screen { background: $surface; }
 
     /* ---- query bar ---- */
     #query-row { height: 3; padding: 0 1; }
@@ -429,19 +481,16 @@ class YtTui(App):
     #query:focus { border: round $accent-lighten-2; }
     #fetch { width: 14; min-width: 14; margin-left: 1; }
 
-    /* ---- options ---- */
-    #target-row { height: 3; padding: 0 1; }
-    #target-row Label { padding: 1 2 0 0; color: $text-muted; }
-    #target { width: 24; }
+    /* ---- what to fetch ---- */
     #opts-row { height: 3; padding: 0 1; }
     #opts-row Checkbox { margin-right: 2; }
-    #langs { width: 22; margin-left: 2; }
+    #langs { width: 20; margin-left: 1; }
 
     /* ---- preview panel ---- */
     /* Fixed height, NOT auto: an auto-height panel expands to fill the
-       screen and pushes the tables and log off the bottom. */
+       screen and pushes the tables off the bottom. */
     #preview {
-        height: 23;
+        height: 22;
         border: round $primary;
         background: $panel;
         margin: 0 1;
@@ -457,7 +506,7 @@ class YtTui(App):
         background: $boost;
     }
 
-    /* ---- tabs ---- */
+    /* ---- quality tables ---- */
     Tabs { height: 3; }
     TabPane { padding: 0 1; }
     DataTable {
@@ -466,26 +515,41 @@ class YtTui(App):
         border: round $panel;
     }
     DataTable > .datatable--header { background: $boost; color: $text; }
-    DataTable > .datatable--cursor {
-        background: $accent 30%;
+    DataTable > .datatable--cursor { background: $accent 30%; }
+
+    /* ---- downloads: permanent panel below the quality table ---- */
+    #downloads {
+        height: 1fr;
+        min-height: 5;
+        border: round $success;
+        margin: 0 1;
     }
+    #downloads-title {
+        height: 1;
+        color: $text-muted;
+        background: $boost;
+    }
+    #dtab { height: 1fr; border: none; background: $surface; }
 
     /* ---- progress ---- */
     #progress-row { height: 3; padding: 0 1; }
     ProgressBar { width: 1fr; }
     #dl-btn { width: 18; min-width: 18; margin-left: 1; }
 
+    /* Hidden until toggled: at 50-row terminals a fixed log competes with
+       the downloads panel and pushed itself off-screen entirely. */
     #log {
-        height: 8;
+        display: none;
+        height: 10;
         border: round $panel;
         background: $panel;
         margin: 0 1;
     }
+    #log.visible { display: block; }
 
     Header { background: $boost; }
     Footer { background: $boost; }
 
-    /* View switching */
     .hidden { display: none; }
     """
 
@@ -498,7 +562,7 @@ class YtTui(App):
         ("w", "show_downloads", "Downloads"),
         ("b", "back", "Back"),
         ("c", "cancel", "Cancel"),
-        ("l", "clear_log", "Clear log"),
+        ("l", "clear_log", "Log"),
         ("q", "quit", "Quit"),
     ]
 
@@ -528,18 +592,15 @@ class YtTui(App):
                         id="query")
             yield Button("Fetch", id="fetch", variant="primary")
 
-        with Horizontal(id="target-row"):
-            yield Label("Get")
-            yield Select([(lbl, val) for lbl, val in TARGETS],
-                         value="video", allow_blank=False, id="target")
-            yield Label("Subs")
-            yield Input(value="en.*,en", id="langs", compact=True)
-
         with Horizontal(id="opts-row"):
-            yield Checkbox("Subtitles", value=True, id="subs")
-            yield Checkbox("Artwork + tags", value=True, id="meta")
-            yield Checkbox("Brave cookies", value=False, id="cookies")
-            yield Checkbox("Raw formats", value=False, id="raw")
+            yield Checkbox("Video", value=True, id="dl-video")
+            yield Checkbox("Audio", value=False, id="dl-audio")
+            yield Checkbox("Subtitles", value=False, id="dl-subs")
+            yield Checkbox("Thumbnail", value=False, id="dl-thumb")
+            yield Checkbox("Tags", value=True, id="meta")
+            yield Checkbox("Raw", value=False, id="raw")
+            yield Checkbox("Cookies", value=False, id="cookies")
+            yield Input(value="en.*,en", id="langs", compact=True)
 
         # Results view (keyword searches only).
         yield DataTable(id="results", cursor_type="row")
@@ -556,8 +617,12 @@ class YtTui(App):
                 yield DataTable(id="vtab", cursor_type="row")
             with TabPane("Audio", id="audio"):
                 yield DataTable(id="atab", cursor_type="row")
-            with TabPane("Downloads", id="downloads"):
-                yield DataTable(id="dtab", cursor_type="row")
+
+        # Downloads is NOT a tab: it lives permanently below the quality
+        # table so progress is always visible instead of hidden behind a tab.
+        with Vertical(id="downloads", classes="hidden"):
+            yield Static("Downloads", id="downloads-title")
+            yield DataTable(id="dtab", cursor_type="row")
 
         with Horizontal(id="progress-row", classes="hidden"):
             yield ProgressBar(id="bar", show_eta=False)
@@ -583,10 +648,9 @@ class YtTui(App):
     # -------------------------------------------------------- view switching
     def _show(self, which: str) -> None:
         detail = which == "detail"
-        # Results is visible exactly when we are NOT in the detail view.
         self.query_one("#results", DataTable).set_class(detail, "hidden")
-        # ...and the detail widgets are visible exactly when we ARE.
-        for wid in ("#preview", "#detail", "#tabs", "#progress-row"):
+        for wid in ("#preview", "#detail", "#tabs", "#progress-row",
+                    "#downloads"):
             self.query_one(wid).set_class(not detail, "hidden")
         if detail:
             self.query_one("#vtab", DataTable).focus()
@@ -878,90 +942,100 @@ class YtTui(App):
 
     # ------------------------------------------------------------- download
     @on(Button.Pressed, "#dl-btn")
+    def _wanted(self) -> dict:
+        """What the user asked to fetch, from the checkbox row."""
+        return {k: bool(self.query_one(f"#{k}", Checkbox).value)
+                for k in ("dl-video", "dl-audio", "dl-subs", "dl-thumb")}
+
+    def _langs(self) -> str:
+        return (self.query_one("#langs", Input).value or "en.*,en").strip()
+
     def action_download(self, other: str | None = None) -> None:
         """Queue a download. `other` overrides the URL (used by tests)."""
         if not self._current_url:
             self.set_detail("Open a video first.", "warn")
             return
 
-        target = self.query_one("#target", Select).value
-        # A format picked under the Video tab must not leak into the
-        # subtitle/thumbnail targets, or the label lies about what was fetched.
-        sel = None if target in ("subs", "thumb") else self._selected
-        if not sel:
-            if target in ("subs", "thumb"):
-                sel = {"kind": "target", "label": "media", "selector": None,
-                       "size": None}
-            else:
-                self.set_detail("Pick a quality first.", "warn")
-                return
+        want = self._wanted()
+        if not any(want.values()):
+            self.set_detail("Tick something to fetch.", "warn")
+            return
+
+        # Audio replaces video unless both are ticked (video wins, since a
+        # merged video already carries the audio track).
+        want_video = want["dl-video"]
+        want_audio = want["dl-audio"] and not want_video
+        langs = self._langs()
+        embed = bool(self.query_one("#meta", Checkbox).value)
+        sel = self._selected
+        if not sel and (want_video or want_audio):
+            self.set_detail("Pick a quality first.", "warn")
+            return
+        sel = sel or {"label": "media", "selector": None, "size": None}
 
         cmd = ["yt-dlp", self._current_url, "--newline",
                "--progress-template",
                "download:PGL|%(progress.status)s|%(progress.downloaded_bytes)s"
                "|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s"
                "|%(progress.speed)s|%(progress.eta)s|%(info.filename)s"]
-
-        sel = self._selected
-        target = self.query_one("#target", Select).value
-        if target in ("subs", "thumb"):
-            sel = {"kind": "target", "label": "media", "selector": None,
-                   "size": None}
-        langs = (self.query_one("#langs", Input).value or "en.*,en").strip()
-        want_subs = bool(self.query_one("#subs", Checkbox).value)
-        embed = bool(self.query_one("#meta", Checkbox).value)
         if other:
             cmd[1] = other
-            sel = dict(sel, label=sel["label"])
 
         label = sel["label"]
-        if target == "subs":
-            # No video needed at all: fetch just the subtitle tracks.
-            cmd += ["--skip-download", "--write-subs", "--write-auto-subs",
-                    "--sub-langs", langs, "--sub-format", "srt/best",
-                    # Safe here: nothing but .srt files is at stake.
-                    "--ignore-errors"]
-            label = f"subs[{langs}] {label}"
-            want_subs = False
-        elif target == "thumb":
-            cmd += ["--skip-download", "--write-thumbnail",
-                    "--convert-thumbnails", "png", "--ignore-errors"]
-            label = f"thumb {label}"
-            want_subs = False
-        elif target == "audio":
+        # Two DISTINCT concepts that were previously conflated into one flag:
+        #   subs_inline   - put --write-subs on THIS command. Only safe when
+        #                   no video is downloading, because a subtitle 429 is
+        #                   fatal and would abort the video.
+        #   subs_secondpass - run _fetch_subs() after a successful download.
+        subs_inline = False
+        subs_secondpass = False
+
+        if want_video:
+            if not sel.get("selector"):
+                self.set_detail("Pick a quality first.", "warn")
+                return
+            cmd += ["--format", sel["selector"], "--merge-output-format", "mp4"]
+            if want["dl-subs"]:
+                cmd += ["--no-write-subs", "--no-write-auto-subs"]
+                subs_secondpass = True
+        elif want_audio:
             codec = sel.get("codec") or "mp3"
             cmd += ["--format", "bestaudio/best", "--extract-audio",
                     "--audio-format", codec]
             if codec != "flac":
                 cmd += ["--audio-quality", "0"]
-            # The label was a quality tier ("1080p"), which is meaningless for
-            # audio. Use the codec, not whatever row happened to be selected.
             label = f"{codec} audio"
-            want_subs = False
-        elif target == "custom":
-            if not sel.get("selector"):
-                self.set_detail("Pick a format id first.", "warn")
-                return
-            cmd += ["--format", sel["selector"]]
-            label = f"custom {sel['selector']}"
-            want_subs = False
+            subs_inline = want["dl-subs"]
         else:
-            cmd += ["--format", sel["selector"], "--merge-output-format", "mp4"]
-            if want_subs:
-                # NOT --ignore-errors: a subtitle 429 would abort the video.
-                # Subtitles are fetched in a separate pass afterwards.
-                cmd += ["--no-write-subs", "--no-write-auto-subs"]
+            # Subtitles and/or thumbnail only: no media stream at all.
+            cmd += ["--skip-download"]
+            label = "subs" if want["dl-subs"] else "thumb"
+            subs_inline = want["dl-subs"]
+
+        if subs_inline:
+            cmd += ["--write-subs", "--write-auto-subs",
+                    "--sub-langs", langs, "--sub-format", "srt/best",
+                    # Safe here: no video is at stake.
+                    "--ignore-errors"]
+        if want["dl-thumb"]:
+            cmd += ["--write-thumbnail", "--convert-thumbnails", "png"]
 
         if not embed:
             cmd += ["--no-embed-metadata", "--no-embed-thumbnail"]
         if self._cookies():
             cmd += ["--cookies-from-browser", f"{BROWSER}:{BROWSER_PROFILE}"]
 
+        parts = [p for p, on in (("video", want_video),
+                                 ("audio", want_audio),
+                                 ("subs", subs_inline or subs_secondpass),
+                                 ("thumb", want["dl-thumb"])) if on]
+        target = "+".join(parts) or "video"
+
         with self._lock:
             self._prog.update(status="starting", pct=0.0, speed="", eta="",
                               file="")
         self.set_detail("Queued …")
-        self.enqueue(cmd, label, sel.get("size"), want_subs, target)
+        self.enqueue(cmd, label, sel.get("size"), subs_secondpass, target)
 
     # ------------------------------------------------------ download queue
     _ITEM_DEFAULTS = {
@@ -1082,6 +1156,10 @@ class YtTui(App):
             self.call_from_thread(self._reap_orphans, jid)
         else:
             self.call_from_thread(self._reap_orphans, jid, only=[".f"])
+        if status == "error":
+            # The error text is the whole point; make sure it can be read.
+            self.call_from_thread(self._reveal_log)
+            note = self.call_from_thread(self._drop_corrupt_output, jid)
 
         # Subtitles as a separate best-effort pass. --ignore-errors is safe
         # here because nothing but the .srt is at stake.
@@ -1117,6 +1195,62 @@ class YtTui(App):
                  in ln]
         return f"{len(wrote)} subtitle file(s)" if wrote else \
             "subs unavailable (rate limited)"
+
+    def _drop_corrupt_output(self, jid: int) -> str:
+        """Delete truncated output files left by an interrupted run.
+
+        Why this is necessary: `--no-overwrites` (set in the shared yt-dlp
+        config) makes yt-dlp treat an existing file as already-downloaded, skip
+        the fetch, and run postprocessing against it. If a previous run was
+        killed mid-merge, that file has no moov atom, so every later attempt
+        fails with "Postprocessing: Error opening input files: Invalid data
+        found when processing input" -- forever, with no way out but deleting
+        it by hand.
+
+        The tracked `path` is NOT reliable here: it comes from the progress
+        template's info.filename, which for a merged download is the last
+        *stream* (e.g. ".f251.webm"), already deleted by the time the error
+        fires. So candidates are matched on the video id from the URL instead.
+
+        Only files ffprobe cannot read are removed, so valid media is spared.
+        """
+        with self._lock:
+            item = next((x for x in self._queue if x["id"] == jid), None)
+        if not item:
+            return ""
+        url = item["cmd"][1] if len(item["cmd"]) > 1 else ""
+        vid = ""
+        m = re.search(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{6,})", url)
+        if m:
+            vid = m.group(1)
+
+        candidates: list[Path] = []
+        if DOWNLOAD_DIR.is_dir():
+            # Match on the video id so only THIS download's files are probed.
+            pattern = f"[{vid}]*" if vid else ""
+            for path in DOWNLOAD_DIR.glob(f"*{pattern}.*"):
+                if path.suffix.lower() in MEDIA_SUFFIXES:
+                    candidates.append(path)
+
+        removed = []
+        for path in candidates:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=60)
+            if probe.returncode == 0:
+                continue                      # readable: leave it alone
+            try:
+                path.unlink()
+                removed.append(path.name[:40])
+            except OSError:
+                pass
+        if not removed:
+            return ""
+        msg = f"removed truncated output {', '.join(removed[:2])}"
+        msg += " (it was blocking retries)"
+        self.log_line(msg, "warn")
+        return msg
 
     def _reap_orphans(self, jid: int, only: list[str] | None = None) -> None:
         """Delete yt-dlp's leftover per-stream files for this download.
@@ -1193,7 +1327,7 @@ class YtTui(App):
         self.set_detail(f"Cancelled #{target}.", "warn")
 
     def action_show_downloads(self) -> None:
-        self.query_one("#tabs").active = "downloads"
+        """Downloads is a permanent panel now, so this just focuses it."""
         self.query_one("#dtab", DataTable).focus()
 
 
@@ -1241,7 +1375,20 @@ class YtTui(App):
         self.query_one("#atab", DataTable).focus()
 
     def action_clear_log(self) -> None:
-        self.query_one("#log", Log).clear()
+        """Toggle the log pane. It competes with the downloads panel for
+        vertical space, so it stays out of the way until asked for -- and is
+        forced open whenever a download fails, which is exactly when you need
+        to read it."""
+        log = self.query_one("#log", Log)
+        log.set_class(not log.has_class("visible"), "visible")
+        if log.has_class("visible"):
+            log.clear()
+
+    def _reveal_log(self) -> None:
+        try:
+            self.query_one("#log", Log).set_class(True, "visible")
+        except Exception:
+            pass
 
     @on(DataTable.RowHighlighted, "#dtab")
     def _dtab_highlight(self, ev: DataTable.RowHighlighted) -> None:

@@ -87,9 +87,21 @@ These were each found by a real failure. Keep them.
   the app reported as a success. Subtitles are fetched in a *separate* second
   pass (`_fetch_subs`) where `--ignore-errors` is safe — only a `.srt` is at
   stake.
-- **Subtitles must never be on the video command.** YouTube rate-limits subtitle
-  requests (HTTP 429) and yt-dlp treats that as fatal, aborting the whole
-  download. Hence the two-pass design.
+- **`--no-overwrites` + a truncated file is an unrecoverable loop.** An
+  interrupted run leaves a file with no `moov` atom; `--no-overwrites` then makes
+  yt-dlp skip the fetch and postprocess the garbage, failing with
+  `Postprocessing: Error opening input files: Invalid data found when
+  processing input` on *every* retry. This is the most likely explanation for
+  the user's original "yt exited" report. `_drop_corrupt_output()` clears it on
+  error — but see the next point for why it needs care.
+- **`item["path"]` is NOT the output file.** It comes from the progress
+  template's `info.filename`, which for a merged download is the last *stream*
+  (`.f251.webm`) — already deleted when the error fires. Any cleanup that relies
+  on it silently does nothing. Match candidates on the video id parsed from the
+  URL instead.
+- **`subs_inline` and `subs_secondpass` are different things.** Conflating them
+  silently dropped subtitles on video+subs jobs. Subtitles go inline on the
+  command only when no video is downloading; otherwise a second pass.
 - **Duplicate URLs are refused** in `enqueue()`. Two yt-dlp processes on one
   output name race in `--embed-thumbnail` (one deletes the `.webp` while the
   other is still converting it to `.png`) and kill each other with ENOENT.
@@ -101,22 +113,46 @@ These were each found by a real failure. Keep them.
 
 ## Thumbnail geometry
 
-Terminal cells are ≈2× taller than wide, and a `▀` half-block carries two pixels
-stacked. So a `cols × rows` cell block is a `cols × rows*2` grid of **square**
-pixels:
+Terminal cells are ≈2× taller than wide. How many colour samples a cell can
+carry depends on the glyph:
 
-```
-cols / (rows * 2) == width / height
-```
+| Glyph | Grid | Samples/cell | At 70×20 cells |
+| --- | --- | --- | --- |
+| `▀` half-block (U+2580) | 1×2 | 2 | 70×40 = 2,800 |
+| braille (U+2800) | 2×4 | 4 | 140×80 = 11,200 |
 
-- The crop target **must equal `cols/(rows*2)` exactly**. Returning the source
+Braille is the default: the top 2×2 dots take the foreground colour, the bottom
+2×2 the background, and each sub-dot is assigned to whichever it resembles —
+which dithers gradients instead of banding. Half-blocks remain available via
+`render_halfblocks(..., braille=False)` for fonts with no braille glyphs.
+
+- Aspect must be solved against the **sample** grid, not the cell grid:
+  braille `2*cols/(4*rows)`, half-block `cols/(2*rows)`. Both give
+  `cols == 2*rows*(w/h)`, but only the sample grid describes the real output.
+- The crop target **must equal the grid aspect exactly**. Returning the source
   aspect instead leaves a mismatch, and since the final `resize()` ignores
   aspect, that silently stretches every thumbnail. This bug shipped once
   *inside its own fix*.
-- Beyond ~4:1 the cell budget cannot express the ratio (the width cap forces
-  fewer than 4 rows). Clamp the target and centre-crop — do not stretch.
-- Ceiling is roughly 58×32 **pixels**. To do better you need Kitty/Sixel, which
-  the user's VTE terminal does not support.
+- Beyond ~4:1 the width cap forces fewer than 4 rows, so the ratio is
+  unrepresentable. Clamp and centre-crop — never stretch.
+- Real ceiling is ~140×80 samples. Going further needs Kitty/Sixel, which the
+  user's VTE terminal does not support.
+
+## Layout
+
+Vertical budget is tight (~50 rows on the user's terminal), so:
+
+- `#preview` is fixed-height. `height: auto` once expanded to fill the screen
+  and pushed the tables off the bottom.
+- `#log` is `display: none` until `L` toggles it, and is forced open on any
+  download error. At a fixed 8 rows it competed with the downloads panel and
+  pushed *itself* off-screen — which is why the user never saw the error text
+  behind the original "yt exited" report.
+- `#downloads` is a permanent panel, not a tab: progress must be visible
+  without switching tabs.
+- What to fetch is a **checkbox row** (`#dl-video`, `#dl-audio`, `#dl-subs`,
+  `#dl-thumb`), and they combine — "video + subtitles" is one job. There is no
+  dropdown; the Video/Audio tabs only choose which quality table you pick from.
 
 ## Textual 8 quirks
 
@@ -171,12 +207,14 @@ during ordinary progress updates.
 ## Known unverified — do not assume these work
 
 - **The entire visual layer.** Wayland screenshot capture is blocked on this
-  machine, so CSS (borders, panel backgrounds, table header/cursor highlighting)
-  is written blind and has never been seen. Only the user can judge it.
-- **The original "download suddenly exits" bug was never reproduced.** A
-  shared-worker-group collision was the suspected cause and is fixed, but that
-  was inference, not observation. If it recurs, the Downloads tab's Detail
-  column carries the real yt-dlp error text.
+  machine, so CSS (borders, panel backgrounds, table header/cursor highlighting,
+  the braille thumbnail's legibility) has never been seen. Only the user can
+  judge it. Braille in particular needs a font with U+2800 glyphs; if the user
+  sees tofu boxes, switch to `braille=False`.
+- **The original "download suddenly exits" report now has a strong candidate**
+  — the `--no-overwrites` + truncated-file loop documented above, which was
+  reproduced exactly. It was fixed after the fact rather than observed live, so
+  treat it as the best explanation rather than a confirmed one.
 - **No screenshot is committed** and `README.md` deliberately does not link one.
   Terminal capture is blocked here; if the user supplies an image, drop it at
   `docs/screenshot.png` and re-add the `![tui](docs/screenshot.png)` line.
