@@ -16,8 +16,23 @@ Author: @krshforever
 
 from __future__ import annotations
 
-import json
 import os
+
+# Thumbnails are drawn with per-cell foreground/background colours, and almost
+# all of the perceived quality is lost if the terminal cannot represent them.
+# Rich/Textual pick the colour system from COLORTERM; this machine reports
+# TERM=xterm-256color with COLORTERM *unset*, so every subtle gradient we
+# compute silently snapped to the same 256-colour entry and the thumbnail
+# rendered as flat bands -- regardless of how many samples we produced.
+#
+# VTE-based terminals (GNOME Terminal, Konsole) do support 24-bit colour; they
+# just do not always advertise it. Claim it before textual/rich are imported.
+# Set YTTUI_TRUECOLOR=0 to opt out on a genuinely 8-bit-only terminal.
+if os.environ.get("COLORTERM", "").lower() in ("", "none") and \
+        os.environ.get("YTTUI_TRUECOLOR", "1") != "0":
+    os.environ["COLORTERM"] = "truecolor"
+
+import json
 import re
 import subprocess
 import threading
@@ -43,7 +58,14 @@ from textual.widgets import (
 )
 
 # --- Config (mirrors ~/.config/yt-dlp/functions.sh) ----------------------
-DOWNLOAD_DIR = Path.home() / "Downloads"
+# The download location is normally ~/.config/yt-dlp/config's --paths, which
+# the app deliberately does NOT restate. YTTUI_DOWNLOAD_DIR overrides that for
+# tests and for users who want output somewhere else; it is passed explicitly
+# because patching DOWNLOAD_DIR alone changes only cleanup, not where yt-dlp
+# actually writes.
+DL_DIR_OVERRIDE = os.environ.get("YTTUI_DOWNLOAD_DIR") or ""
+DOWNLOAD_DIR = Path(DL_DIR_OVERRIDE) if DL_DIR_OVERRIDE \
+    else Path.home() / "Downloads"
 BROWSER = "brave"
 BROWSER_PROFILE = "Default"
 SEARCH_COUNT = 10
@@ -399,6 +421,20 @@ def render_halfblocks(path: Path | None,
     except Exception:
         return None, 0, 0
 
+    # YouTube thumbnails are frequently very dark (mean luminance ~25/255),
+    # which at 140x80 samples reads as near-black mush. Lift and stretch the
+    # range so the picture is legible instead of merely faithful.
+    try:
+        from PIL import ImageEnhance, ImageStat
+        stat = ImageStat.Stat(img.convert("L"))
+        mean = stat.mean[0]
+        if mean < 90:
+            img = ImageEnhance.Brightness(img).enhance(
+                1.0 + (90 - mean) / 120.0)
+        img = ImageEnhance.Contrast(img).enhance(1.25)
+    except Exception:
+        pass
+
     cols, rows = thumb_cells(*img.size, max_cols, max_rows)
     target = _thumb_grid_aspect(cols, rows, braille)
 
@@ -495,7 +531,10 @@ class YtTui(App):
         background: $panel;
         margin: 0 1;
     }
-    #thumb { width: 30; padding: 0 1; }
+    /* width/height are set from Python to match the generated grid exactly.
+       Padding here would shrink the CONTENT box below the line width, so every
+       line would wrap and the grid would render clipped and the wrong aspect. */
+    #thumb { padding: 0; width: auto; height: auto; overflow: hidden; }
     #info-scroll { width: 1fr; }
     #info { width: 1fr; padding: 1 2; }
 
@@ -899,16 +938,18 @@ class YtTui(App):
 
     def _apply_thumb(self, art, cols: int, rows: int) -> None:
         thumb = self.query_one("#thumb", Static)
-        # Size the widget to the real cell grid, otherwise the grid is clipped
-        # or stretched to whatever the CSS width happened to be.
-        thumb.styles.width = cols
-        thumb.styles.height = rows
         if art is None:
             thumb.update(Text("no thumbnail", style="dim"))
             return
-        preview = self.query_one("#preview")
-        preview.styles.height = max(rows + 2, 8)
+        # Size the widget to the grid, content-box exact. Any padding or border
+        # here shrinks the content width below the line width and every row
+        # wraps, which renders clipped and visibly wrong aspect.
+        thumb.styles.width = cols
+        thumb.styles.height = rows
+        self.query_one("#preview").styles.height = rows + 2
         thumb.update(art)
+        self.log_line(f"thumbnail {cols}x{rows} cells "
+                      f"({cols * 2}x{rows * 4} samples)", "ok")
 
     @on(DataTable.RowHighlighted, "#vtab")
     @on(DataTable.RowHighlighted, "#atab")
@@ -1022,6 +1063,8 @@ class YtTui(App):
 
         if not embed:
             cmd += ["--no-embed-metadata", "--no-embed-thumbnail"]
+        if DL_DIR_OVERRIDE:
+            cmd += ["--paths", str(DOWNLOAD_DIR)]
         if self._cookies():
             cmd += ["--cookies-from-browser", f"{BROWSER}:{BROWSER_PROFILE}"]
 
@@ -1054,8 +1097,11 @@ class YtTui(App):
             # is still converting it, killing it with ENOENT. Observed as
             # "No such file or directory: '<name>.png'". Refuse duplicates.
             url = cmd[1] if len(cmd) > 1 else ""
-            if any(x["status"] in ("queued", "downloading")
-                   and x["cmd"][1:2] == [url] for x in self._queue):
+            # .get(): the queue can be mutated out from under a finishing
+            # worker (the test suite clears it between cases), and a partial
+            # item must never raise out of a worker thread.
+            if any(x.get("status") in ("queued", "downloading")
+                   and x.get("cmd", [])[1:2] == [url] for x in self._queue):
                 self.log_line(
                     f"already downloading this one: {label[:40]}", "warn")
                 self.set_detail("Already downloading that. Skipped.", "warn")
@@ -1126,7 +1172,7 @@ class YtTui(App):
     def download_worker(self, jid: int, **kw) -> None:
         with self._lock:
             it = next((x for x in self._queue if x["id"] == jid), None)
-            cmd = list(it["cmd"]) if it else []
+            cmd = list(it.get("cmd") or []) if it else []
         self.call_from_thread(self._queue_update, jid, status="downloading")
         code, error = 1, ""
         try:
@@ -1218,7 +1264,7 @@ class YtTui(App):
             item = next((x for x in self._queue if x["id"] == jid), None)
         if not item:
             return ""
-        url = item["cmd"][1] if len(item["cmd"]) > 1 else ""
+        url = (item.get("cmd") or [None, None])[1]
         vid = ""
         m = re.search(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{6,})", url)
         if m:

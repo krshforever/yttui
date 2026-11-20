@@ -10,6 +10,7 @@ fixture failures in earlier iterations.
 import asyncio
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -206,13 +207,68 @@ def layer1():
 
 # ======================= LAYER 2 =======================
 async def layer2():
+    print("\n=== L2: log visibility (must precede any real download) ===")
+    app = yttui.YtTui()
+    async with app.run_test(size=(150, 46)) as pilot:
+        a = pilot.app
+        log = a.query_one("#log")
+        check("log hidden by default", not log.has_class("visible"))
+        a.action_clear_log()
+        check("L toggles log on", log.has_class("visible"))
+        a.action_clear_log()
+        check("L toggles log off", not log.has_class("visible"))
+        a._reveal_log()
+        check("error forces log open", log.has_class("visible"))
+        a.action_clear_log()
+        check("L closes it again", not log.has_class("visible"))
+
+    print("\n=== L2: thumbnail widget fits its grid exactly ===")
+    # Regression: #thumb had `padding: 0 1`, so a styles.width equal to the
+    # generated line width left the content box 2 columns short. Every line
+    # wrapped, the grid was clipped and the thumbnail looked the wrong aspect.
+    app = yttui.YtTui()
+    async with app.run_test(size=(150, 46)) as pilot:
+        a = pilot.app
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "t.png"
+            Image.new("RGB", (1280, 720), (90, 120, 200)).save(src)
+            art, gc, gr = yttui.render_halfblocks(src)
+            a._apply_thumb(art, gc, gr)
+            await pilot.pause(0.2)
+            thumb = a.query_one("#thumb")
+            lines = [ln for ln in art.plain.splitlines() if ln]
+            widest = max(len(ln) for ln in lines)
+            cw = thumb.styles.width.value
+            check("every grid line equal width",
+                  len({len(ln) for ln in lines}) == 1,
+                  sorted({len(ln) for ln in lines}))
+            check("widget width == line width (no wrap)", int(cw) == widest,
+                  f"widget {cw} vs line {widest}")
+            check("row count matches widget height",
+                  int(thumb.styles.height.value) == len(lines),
+                  f"{thumb.styles.height.value} vs {len(lines)}")
+            check("grid aspect matches a 16:9 source",
+                  abs((gc * 2) / (gr * 4) - 16 / 9) / (16 / 9) < 0.05,
+                  f"{gc}x{gr} -> {(gc * 2) / (gr * 4):.3f}")
+
     print("\n=== L2: what-to-fetch checkboxes build the right command ===")
     app = yttui.YtTui()
     async with app.run_test(size=(150, 46)) as pilot:
         a = pilot.app
 
+        async def settle():
+            # Let any queued download finish before the queue is reset;
+            # clearing it mid-flight leaves live workers holding stale state.
+            for _ in range(90):
+                await pilot.pause(1.0)
+                if not any(x.get("status") in ("queued", "downloading")
+                           for x in a._queue):
+                    break
+
         async def set_boxes(**kw):
             from textual.widgets import Checkbox
+            await settle()
             a.query_one("#dl-video", Checkbox).value = kw.get("video", False)
             a.query_one("#dl-audio", Checkbox).value = kw.get("audio", False)
             a.query_one("#dl-subs", Checkbox).value = kw.get("subs", False)
@@ -289,17 +345,21 @@ async def layer2():
 
         print("\n=== L2: guards ===")
         a._selected = dict(video_sel)
+        await settle()
         a._queue = []
         await set_boxes()
         check("nothing ticked refused", len(a._queue) == 0)
         a._selected = None
+        await settle()
         a._queue = []
         await set_boxes(video=True)
         check("video w/o quality refused", len(a._queue) == 0)
         a._selected = None
+        await settle()
         a._queue = []
         await set_boxes(audio=True)
         check("audio w/o quality refused", len(a._queue) == 0)
+        await settle()
 
         print("\n=== L2: corrupt-output guard ===")
         # Regression: the tracked progress path points at the last *stream*
@@ -401,15 +461,8 @@ async def layer2():
         a._show("results")
         check("back hides detail", a.query_one("#preview").has_class("hidden"))
 
-        log = a.query_one("#log")
-        check("log hidden by default", not log.has_class("visible"))
-        a.action_clear_log()
-        check("L toggles log on", log.has_class("visible"))
-        a.action_clear_log()
-        check("L toggles log off", not log.has_class("visible"))
-        a._reveal_log()
-        check("error forces log open", log.has_class("visible"))
-        a.action_clear_log()
+        # NOTE: log-visibility is asserted at the TOP of layer2, before any
+        # queued download can fail and auto-reveal the log.
 
 
 # ======================= LAYER 3 =======================
@@ -437,44 +490,75 @@ async def layer3():
     check("search count", 0 < len(res) <= 3, len(res))
 
     print("\n=== L3: concurrent downloads ===")
-    app = yttui.YtTui()
-    async with app.run_test(size=(150, 46)) as pilot:
-        a = pilot.app
-        a.query_one("#tabs").set_class(False, "hidden")
-        for w in ("#preview", "#detail", "#progress-row"):
-            a.query_one(w).set_class(False, "hidden")
-        a.query_one("#results").set_class(True, "hidden")
-        a._info = info
-        a._current_url = info["webpage_url"]
-        a._vrows = yttui.build_tiers(info)
-        a._fill_video(False)
-        a._arows = yttui.audio_rows(int(info.get("duration") or 0))
-        a._fill_audio()
-        row = a._vrows[-1]
-        a._selected = row
-        a.action_download()
-        await pilot.pause(1.0)
-        check("duplicate URL refused", len(a._queue) == 1, len(a._queue))
-        a._selected = row
-        a.action_download(other="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        await pilot.pause(1.0)
-        check("two queued", len(a._queue) == 2, len(a._queue))
-        check("distinct ids", [x["id"] for x in a._queue] == [1, 2])
-        check("distinct URLs", a._queue[0]["cmd"][1] != a._queue[1]["cmd"][1])
-        dt = a.query_one("#dtab", DataTable)
-        check("two queue rows", dt.row_count == 2, dt.row_count)
-        for _ in range(240):
+    # Hermetic output dir. Re-running against the real ~/Downloads inherits
+    # leftover .webp/.png/.srt sidecars, and with --no-overwrites yt-dlp then
+    # skips the fetch and re-postprocesses stale state ("Error opening output
+    # files: Invalid argument"). Must be set before import so DOWNLOAD_DIR and
+    # the --paths override both pick it up.
+    import shutil
+    import tempfile as _tf3
+    sandbox = Path(_tf3.mkdtemp(prefix="yttui-l3-"))
+    os.environ["YTTUI_DOWNLOAD_DIR"] = str(sandbox)
+    l3 = importlib.machinery.SourceFileLoader("yttui_l3", YTTUI)
+    l3_spec = importlib.util.spec_from_loader("yttui_l3", l3)
+    mod = importlib.util.module_from_spec(l3_spec)
+    l3_spec.loader.exec_module(mod)
+    app = mod.YtTui()
+    try:
+        async with app.run_test(size=(150, 46)) as pilot:
+            a = pilot.app
+            for w in ("#tabs", "#preview", "#detail", "#progress-row"):
+                a.query_one(w).set_class(False, "hidden")
+            a.query_one("#results").set_class(True, "hidden")
+            a._info = info
+            a._current_url = info["webpage_url"]
+            a._vrows = mod.build_tiers(info)
+            a._fill_video(False)
+            a._arows = mod.audio_rows(int(info.get("duration") or 0))
+            a._fill_audio()
+            row = a._vrows[-1]
+            a._selected = row
+            a.action_download()
             await pilot.pause(1.0)
-            if all(x["status"] in ("done", "error", "cancelled")
-                   for x in a._queue):
-                break
-        st = [x["status"] for x in a._queue]
-        check("both settled", "downloading" not in st, st)
-        check("both succeeded", all(s == "done" for s in st),
-              [(x["id"], x["status"], x["error"]) for x in a._queue])
-        for x in a._queue:
-            print(f"    #{x['id']} {x['status']} {x['file'][:40]} "
-                  f"subs={x['subs']!r}")
+            check("duplicate URL refused", len(a._queue) == 1, len(a._queue))
+            a._selected = row
+            a.action_download(
+                other="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            await pilot.pause(1.0)
+            check("two queued", len(a._queue) == 2, len(a._queue))
+            check("distinct ids", [x["id"] for x in a._queue] == [1, 2])
+            check("distinct URLs", a._queue[0]["cmd"][1] != a._queue[1]["cmd"][1])
+            check("sandbox path passed to yt-dlp",
+                  "--paths" in a._queue[0]["cmd"], a._queue[0]["cmd"][:3])
+            dt = a.query_one("#dtab", DataTable)
+            check("two queue rows", dt.row_count == 2, dt.row_count)
+            for _ in range(240):
+                await pilot.pause(1.0)
+                if all(x["status"] in ("done", "error", "cancelled")
+                       for x in a._queue):
+                    break
+            st = [x["status"] for x in a._queue]
+            check("both settled", "downloading" not in st, st)
+            check("both succeeded", all(s == "done" for s in st),
+                  [(x["id"], x["status"], x["error"]) for x in a._queue])
+            for x in a._queue:
+                print(f"    #{x['id']} {x['status']} {x['file'][:40]} "
+                      f"subs={x['subs']!r}")
+            media = sorted(p.name for p in sandbox.iterdir()
+                           if p.suffix.lower() in (".mp4", ".mkv", ".webm"))
+            check("media landed in the sandbox", bool(media),
+                  sorted(p.name for p in sandbox.iterdir())[:6])
+            for name in media:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries",
+                     "format=duration", "-of", "csv=p=0",
+                     str(sandbox / name)],
+                    capture_output=True, text=True, timeout=60)
+                check(f"  {name[:36]} is valid media",
+                      probe.returncode == 0, probe.stderr[:60])
+    finally:
+        os.environ.pop("YTTUI_DOWNLOAD_DIR", None)
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 async def main():
